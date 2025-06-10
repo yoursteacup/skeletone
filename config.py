@@ -14,11 +14,6 @@ class AppSettings(BaseSettings):
     allowed_origins: List[str] | None = None
     secret_key: str
     requests_timeout: int
-    token_ttl_hours: int
-    token_secret: str
-    max_concurrency: int = 50
-    task_await_time: int = 5
-    task_check_interval: float = 0.25
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -54,73 +49,6 @@ class DatabaseSettings(BaseSettings):
     )
 
 
-class ServiceSettings(BaseSettings):
-    gov_url: str
-    user_profile_url: str
-    user_profile_secret: str
-    email_url: str
-    s1c_url: str
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="SERVICE_",
-        extra="ignore"
-    )
-
-
-class WebviewSettings(BaseSettings):
-    url: str
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="WEBVIEW_",
-        extra="ignore"
-    )
-
-
-class EmailSettings(BaseSettings):
-    compliance_dpt: str
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="EMAIL_",
-        extra="ignore"
-    )
-
-
-class RBKSettings(BaseSettings):
-    username: str
-    password: str
-    url: str
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="RBK_",
-        extra="ignore"
-    )
-
-
-class TarlanSettings(BaseSettings):
-    api_url: str
-    merchant_id: str
-    project_id: str
-    secret: str
-    redirect_url: str
-    callback_url: str
-    callback_secret: str
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="TARLAN_",
-        extra="ignore"
-    )
-
-
 class MainSettings(BaseModel):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -131,11 +59,6 @@ class MainSettings(BaseModel):
 
     app: AppSettings = AppSettings()  # type: ignore
     database: DatabaseSettings = DatabaseSettings()  # type: ignore
-    services: ServiceSettings = ServiceSettings()  # type: ignore
-    webview: WebviewSettings = WebviewSettings()  # type: ignore
-    email: EmailSettings = EmailSettings()  # type: ignore
-    rbk: RBKSettings = RBKSettings()  # type: ignore
-    tarlan: TarlanSettings = TarlanSettings()  # type: ignore
 
 
 settings = MainSettings()
