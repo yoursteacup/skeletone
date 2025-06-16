@@ -5,10 +5,8 @@ Built on top of **FastAPI**, **SQLAlchemy**, and **Alembic**.
 
 # Diffmake for skeletone upgrade
  - `git commit` - skeletone updated
- - `git tag` - tagged
- - `git diff <prv_tag> <cur_tag> > patches/<prv_tag>_to_<cur_tag>.path` - diff ready 
- - `git add` - added
- - `git push` - pushed
+ - `git tag <tag V>` - tagged
+ - `./make_diff.sh` - apply patch 
 
 ## Author
 Developer: Zhaxybayev Daulet
