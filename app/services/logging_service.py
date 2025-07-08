@@ -1,6 +1,8 @@
 import inspect
 import logging
+from typing import Optional
 
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.application_logs import ApplicationLogs
 from app.services.sessionmaking import get_session
 from app.utils.enums import LogLevel
@@ -15,7 +17,7 @@ LOGGING_LEVELS = {
 
 class LogService:
     def __init__(self):
-        pass
+        self._session_pool: Optional[AsyncSession] = None
 
     async def log(self, message: str, level: LogLevel):
         current_frame = inspect.currentframe()
@@ -40,15 +42,32 @@ class LogService:
             context
         )
 
-        async for session in get_session():
-            new_log = ApplicationLogs(
-                message=message,
-                level=level.value,
-                context=context,
-            )
-
-            session.add(new_log)
-            await session.commit()
+        # Use pooled session or create new one
+        if self._session_pool is None:
+            async for session in get_session():
+                try:
+                    new_log = ApplicationLogs(
+                        message=message,
+                        level=level.value,
+                        context=context,
+                    )
+                    session.add(new_log)
+                    await session.commit()
+                except Exception as e:
+                    logging.error(f"Failed to log to database: {e}")
+                    await session.rollback()
+        else:
+            try:
+                new_log = ApplicationLogs(
+                    message=message,
+                    level=level.value,
+                    context=context,
+                )
+                self._session_pool.add(new_log)
+                await self._session_pool.commit()
+            except Exception as e:
+                logging.error(f"Failed to log to database: {e}")
+                await self._session_pool.rollback()
 
     async def log_info(self, message: str):
         await self.log(message, LogLevel.INFO)
@@ -65,3 +84,7 @@ class LogService:
     @staticmethod
     def _get_logging_level(level: LogLevel):
         return LOGGING_LEVELS[level]
+
+
+# Modular singleton - single instance for the entire application
+log_service = LogService()
