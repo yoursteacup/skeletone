@@ -70,24 +70,3 @@ index b841ac6..e4a917d 100644
 +
 +# Modular singleton - single instance for the entire application
 +log_service = LogService()
-diff --git a/make_diff.sh b/make_diff.sh
-deleted file mode 100755
-index 49cf95e..0000000
---- a/make_diff.sh
-+++ /dev/null
-@@ -1,14 +0,0 @@
--#!/bin/bash
--
--# Название скрипта (чтобы исключить из diff)
--SCRIPT_NAME=$(basename "$0")
--
--# Получаем последние два тега (сортировка по времени)
--TAGS=($(git tag --sort=-creatordate))
--LATEST_TAG=${TAGS[0]}
--PREV_TAG=${TAGS[1]}
--echo "📌 Сравниваем теги: $PREV_TAG → $LATEST_TAG"
--PATCH_NAME="${PREV_TAG}_to_${LATEST_TAG}.patch"
--
--# Выполняем git diff с исключением определённых путей
--git diff "$PREV_TAG" "$LATEST_TAG" -- . ':!patches/' ':!README.md' ":!$SCRIPT_NAME" > patches/$PATCH_NAME
-\ No newline at end of file
