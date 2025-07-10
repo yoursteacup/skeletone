@@ -1,0 +1,252 @@
+diff --git a/app/__main__.py b/app/__main__.py
+index 69d7582..99904e1 100644
+--- a/app/__main__.py
++++ b/app/__main__.py
+@@ -9,7 +9,7 @@ app = FastAPI()
+ origins = settings.app.allowed_origins
+ app.add_middleware(
+     CORSMiddleware,  # noqa
+-    allow_origins=origins,
++    allow_origins=origins or [],
+     allow_credentials=True,
+     allow_methods=['*'],
+     allow_headers=['*'],
+diff --git a/app/services/logging_service.py b/app/services/logging_service.py
+index 0b8f6c5..6b5664e 100644
+--- a/app/services/logging_service.py
++++ b/app/services/logging_service.py
+@@ -1,7 +1,7 @@
+ import asyncio
+ import inspect
+ import logging
+-import random
++import secrets
+ from datetime import datetime, timezone
+ from typing import Optional, List, Deque
+ from collections import deque
+@@ -26,7 +26,7 @@ class LogService:
+     Асинхронный сервис логирования для FastAPI.
+     Использует батчинг и фоновую задачу для эффективной записи в БД.
+     """
+-    
++
+     def __init__(
+         self,
+         batch_size: int = 50,
+@@ -41,20 +41,20 @@ class LogService:
+         self._lock = asyncio.Lock()
+         self._last_flush = datetime.now(timezone.utc)
+         self._flush_task: Optional[asyncio.Task] = None
+-        
++
+         # Retry configuration
+         self._max_retries = max_retries
+         self._retry_base_delay = retry_base_delay
+         self._retry_max_delay = retry_max_delay
+-        
++
+         # Failed batch storage for retry
+         self._failed_batches: Deque[List[tuple]] = deque(maxlen=100)
+ 
+     async def initialize(self):
+         """Инициализация сервиса при старте приложения"""
+         self._flush_task = asyncio.create_task(self._periodic_flush())
+-        logging.info("LogService initialized with batch_size=%d, flush_interval=%.1fs", 
+-                    self._batch_size, self._flush_interval)
++        logging.info("LogService initialized with batch_size=%d, flush_interval=%.1fs",
++                     self._batch_size, self._flush_interval)
+ 
+     async def shutdown(self):
+         """Корректное завершение работы при остановке приложения"""
+@@ -64,14 +64,14 @@ class LogService:
+                 await self._flush_task
+             except asyncio.CancelledError:
+                 pass
+-        
++
+         await self._force_flush()
+         logging.info("LogService shutdown complete")
+ 
+     async def log(self, message: str, level: LogLevel):
+         """Основной метод логирования"""
+         context = self._get_context()
+-        
++
+         # Немедленное логирование в stdout
+         logging.log(
+             self._get_logging_level(level),
+@@ -80,7 +80,7 @@ class LogService:
+             message,
+             context
+         )
+-        
++
+         # Добавляем в батч для БД
+         async with self._lock:
+             self._batch.append((
+@@ -89,7 +89,7 @@ class LogService:
+                 context,
+                 datetime.now(timezone.utc)
+             ))
+-            
++
+             # Проверяем необходимость немедленного flush
+             if len(self._batch) >= self._batch_size:
+                 await self._flush()
+@@ -111,19 +111,19 @@ class LogService:
+         while True:
+             try:
+                 await asyncio.sleep(self._flush_interval)
+-                
++
+                 async with self._lock:
+                     if self._batch:
+                         await self._flush()
+-                    
++
+                     # Пытаемся переотправить неудачные батчи
+                     if self._failed_batches:
+                         await self._retry_failed_batches()
+-                        
++
+             except asyncio.CancelledError:
+                 break
+             except Exception as e:
+-                logging.error(f"Error in periodic flush: {e}")
++                logging.error("Error in periodic flush: %s", e)
+ 
+     async def _force_flush(self):
+         """Принудительный flush всех логов"""
+@@ -135,19 +135,19 @@ class LogService:
+         """Сохранение батча логов в БД (вызывается под lock)"""
+         if not self._batch:
+             return
+-            
++
+         # Копируем батч и очищаем
+         batch_to_save = list(self._batch)
+         self._batch.clear()
+         self._last_flush = datetime.now(timezone.utc)
+-        
++
+         # Сохраняем без блокировки основного потока
+         success = await self._save_batch_with_retry(batch_to_save)
+-        
++
+         if not success:
+             # Сохраняем неудачный батч для последующей попытки
+             self._failed_batches.append(batch_to_save)
+-            logging.error(f"Failed to save batch after {self._max_retries} retries, stored for later")
++            logging.error("Failed to save batch after %d retries, stored for later", self._max_retries)
+ 
+     async def _save_batch_with_retry(self, batch: List[tuple]) -> bool:
+         """Сохранение батча с retry логикой"""
+@@ -160,33 +160,33 @@ class LogService:
+                 if attempt < self._max_retries - 1:
+                     # Экспоненциальная задержка с jitter
+                     delay = min(
+-                        self._retry_base_delay * (2 ** attempt) + random.uniform(0, 0.1),
++                        self._retry_base_delay * (2 ** attempt) + secrets.randbelow(100) / 1000,
+                         self._retry_max_delay
+                     )
+                     logging.warning(
+-                        f"Database error on attempt {attempt + 1}/{self._max_retries}: {e}. "
+-                        f"Retrying in {delay:.2f}s..."
++                        "Database error on attempt %d/%d: %s. Retrying in %.2fs...",
++                        attempt + 1, self._max_retries, e, delay
+                     )
+                     await asyncio.sleep(delay)
+                 else:
+-                    logging.error(f"Final attempt failed: {e}")
++                    logging.error("Final attempt failed: %s", e)
+             except Exception as e:
+                 # Неожиданная ошибка - не пытаемся повторить
+-                logging.error(f"Unexpected error saving batch: {e}")
++                logging.error("Unexpected error saving batch: %s", e)
+                 return False
+-        
++
+         return False
+ 
+     async def _retry_failed_batches(self):
+         """Повторная попытка отправки неудачных батчей"""
+         if not self._failed_batches:
+             return
+-        
++
+         # Берем до 5 батчей для повторной отправки
+         batches_to_retry = []
+         for _ in range(min(5, len(self._failed_batches))):
+             batches_to_retry.append(self._failed_batches.popleft())
+-        
++
+         successfully_sent = 0
+         for batch in batches_to_retry:
+             if await self._save_batch_with_retry(batch):
+@@ -194,9 +194,9 @@ class LogService:
+             else:
+                 # Возвращаем в конец очереди
+                 self._failed_batches.append(batch)
+-        
++
+         if successfully_sent > 0:
+-            logging.info(f"Successfully resent {successfully_sent} failed batches")
++            logging.info("Successfully resent %d failed batches", successfully_sent)
+ 
+     async def _save_batch(self, session: AsyncSession, batch: List[tuple]):
+         """Сохранение батча в БД"""
+@@ -210,7 +210,7 @@ class LogService:
+             # Преобразуем timezone-aware datetime в naive для PostgreSQL
+             log.creation_date = timestamp.replace(tzinfo=None)
+             logs.append(log)
+-        
++
+         session.add_all(logs)
+         await session.commit()
+ 
+@@ -218,25 +218,25 @@ class LogService:
+         """Получение контекста вызова"""
+         current_frame = inspect.currentframe()
+         frames_to_skip = 3
+-        
++
+         frame = current_frame
+         for _ in range(frames_to_skip):
+             if frame and frame.f_back:
+                 frame = frame.f_back
+             else:
+                 return "unknown"
+-        
++
+         if frame:
+             filename = frame.f_code.co_filename
+             line_number = frame.f_lineno
+             function_name = frame.f_code.co_name
+-            
++
+             # Убираем полный путь, оставляем только относительный
+             if "/app/" in filename:
+                 filename = filename.split("/app/", 1)[1]
+-            
++
+             return f"{filename}:{line_number} in {function_name}"
+-        
++
+         return "unknown"
+ 
+     @staticmethod
+diff --git a/setup.cfg b/setup.cfg
+index b153dfe..89a8809 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -15,7 +15,9 @@ ignore =
+ disable =
+     C0103, C0114, C0115, C0116, C0121,
+     E1101, E1102, E1136,
+-    R0801, R0903, R0911, R0913, R1719,
++    R0801,
++    R0903, R0911, R0913, R0902, R0917,
++    R1719,
+     W0105,
+     W0511, W0612, W0613, W0707, W0718
+ max-line-length = 128
