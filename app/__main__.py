@@ -1,11 +1,22 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import logging_middleware
+from app.services.logging_service import setup_logging, teardown_logging
 from app.services.sessionmaking import get_session
 from config import settings
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await setup_logging()
+    yield
+    await teardown_logging()
+
+
+app = FastAPI(lifespan=lifespan)
 origins = settings.app.allowed_origins
 app.add_middleware(
     CORSMiddleware,  # noqa
