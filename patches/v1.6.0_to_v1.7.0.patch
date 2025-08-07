@@ -1,0 +1,115 @@
+diff --git a/app/__main__.py b/app/__main__.py
+index 668efa0..7abf83b 100644
+--- a/app/__main__.py
++++ b/app/__main__.py
+@@ -4,13 +4,14 @@ from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+ from app import logging_middleware
++from app.routers import get_all_routers
+ from app.services.logging_service import setup_logging, teardown_logging
+-from app.services.sessionmaking import get_session
++from app.services.sessionmaking import async_session
+ from config import settings
+ 
+ 
+ @asynccontextmanager
+-async def lifespan(app: FastAPI):
++async def lifespan(fastapi_app: FastAPI):
+     await setup_logging()
+     yield
+     await teardown_logging()
+@@ -26,12 +27,15 @@ app.add_middleware(
+     allow_headers=['*'],
+ )
+ 
++for router in get_all_routers():
++    app.include_router(router)
++
+ 
+ @app.middleware("http")
+ async def log_requests(request: Request, call_next):
+-    async for session in get_session():  # noqa
+-        request.state.session = session
+-        return await logging_middleware.convoy_with_logs(request, call_next)
++    session = async_session()
++    request.state.session = session
++    return await logging_middleware.convoy_with_logs(request, call_next)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/app/dependencies/authorization.py b/app/dependencies/authorization.py
+index edb2098..af2c39b 100644
+--- a/app/dependencies/authorization.py
++++ b/app/dependencies/authorization.py
+@@ -11,3 +11,5 @@ async def authorize(secret_key: str = Header(alias="Authorization")) -> None:
+             status_code=401,
+             detail="Missing or invalid Authorization header"
+         )
++
++    return None
+diff --git a/app/routers/__init__.py b/app/routers/__init__.py
+new file mode 100644
+index 0000000..7c896e3
+--- /dev/null
++++ b/app/routers/__init__.py
+@@ -0,0 +1,26 @@
++import pkgutil
++import importlib
++from typing import List
++from fastapi import APIRouter
++
++
++def get_all_routers() -> List[APIRouter]:
++    """
++    Automatically discovers and imports all routers from module.
++    Returns list of APIRouter objects.
++    Each router file should contain 'router' variable of APIRouter type.
++    Routers should have prefix, tags and dependencies set up.
++    """
++    routers = []
++    package_dir = __path__[0]
++
++    for _, module_name, is_pkg in pkgutil.iter_modules([package_dir]):
++        if module_name == "__init__":
++            continue
++
++        module = importlib.import_module(f".{module_name}", package=__name__)
++
++        if hasattr(module, "router") and isinstance(module.router, APIRouter):
++            routers.append(module.router)
++
++    return routers
+diff --git a/app/routers/health.py b/app/routers/health.py
+new file mode 100644
+index 0000000..8bc585a
+--- /dev/null
++++ b/app/routers/health.py
+@@ -0,0 +1,11 @@
++from fastapi import APIRouter
++
++router = APIRouter(
++    prefix="/health",
++    tags=["health"],
++)
++
++
++@router.get("")
++async def health_check():
++    return {"status": "ok"}
+diff --git a/app/routes/__init__.py b/app/routes/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/requirements.txt b/requirements.txt
+index ada1b8e..7b0843d 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -10,7 +10,7 @@ alembic==1.13.2
+ asyncpg==0.29.0
+ psycopg2-binary==2.9.9
+ 
+-pydantic~=2.10.6
++pydantic==2.11.3
+ pydantic-settings==2.7.1
+ 
+ mypy==1.15.0
