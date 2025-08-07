@@ -11,3 +11,5 @@ async def authorize(secret_key: str = Header(alias="Authorization")) -> None:
             status_code=401,
             detail="Missing or invalid Authorization header"
         )
+
+    return None
