@@ -1,0 +1,360 @@
+diff --git a/Dockerfile b/Dockerfile
+index d55690a..6c26cb6 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -2,10 +2,6 @@ FROM python:3.12-slim
+ 
+ WORKDIR /app
+ 
+-# Установка wkhtmltopdf
+-RUN apt-get update && apt-get install -y --no-install-recommends wkhtmltopdf \
+-  && apt-get clean && rm -rf /var/lib/apt/lists/*
+-
+ COPY requirements.txt .
+ RUN pip install -r requirements.txt
+ 
+diff --git a/app/__main__.py b/app/__main__.py
+index 7abf83b..f04e1a1 100644
+--- a/app/__main__.py
++++ b/app/__main__.py
+@@ -4,17 +4,24 @@ from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+ from app import logging_middleware
++from app.lifespan import get_all_shutdown_tasks, get_all_startup_tasks
+ from app.routers import get_all_routers
+-from app.services.logging_service import setup_logging, teardown_logging
+ from app.services.sessionmaking import async_session
++from app.utils.uvicorn_log_config import log_config
+ from config import settings
+ 
+ 
+ @asynccontextmanager
+ async def lifespan(fastapi_app: FastAPI):
+-    await setup_logging()
++    # Run all startup tasks
++    for startup_task in get_all_startup_tasks():
++        await startup_task()
++
+     yield
+-    await teardown_logging()
++
++    # Run all shutdown tasks
++    for shutdown_task in get_all_shutdown_tasks():
++        await shutdown_task()
+ 
+ 
+ app = FastAPI(lifespan=lifespan)
+@@ -41,4 +48,9 @@ async def log_requests(request: Request, call_next):
+ if __name__ == "__main__":
+     import uvicorn  # noqa
+ 
+-    uvicorn.run(app, host="0.0.0.0", port=settings.app.port)  # nosec B104 - safe inside docker behind nginx
++    uvicorn.run(
++        app,
++        host="0.0.0.0",  # nosec B104 - safe inside docker behind nginx
++        port=settings.app.port,
++        log_config=log_config
++    )
+diff --git a/app/dependencies/authorization.py b/app/dependencies/authorization.py
+index af2c39b..da8f02b 100644
+--- a/app/dependencies/authorization.py
++++ b/app/dependencies/authorization.py
+@@ -5,11 +5,20 @@ from config import settings
+ SECRET_KEY = settings.app.secret_key
+ 
+ 
+-async def authorize(secret_key: str = Header(alias="Authorization")) -> None:
+-    if not secret_key or not secret_key.startswith("Bearer "):
++async def authorize(
++        authorization: str = Header(alias="Authorization")
++) -> None:
++    if not authorization or not authorization.startswith("Bearer "):
+         raise HTTPException(
+             status_code=401,
+             detail="Missing or invalid Authorization header"
+         )
+ 
+-    return None
++    token = authorization.replace("Bearer ", "")
++    if token != SECRET_KEY:
++        raise HTTPException(
++            status_code=401,
++            detail="Missing or invalid Authorization header"
++        )
++
++    return None
+\ No newline at end of file
+diff --git a/app/lifespan/__init__.py b/app/lifespan/__init__.py
+new file mode 100644
+index 0000000..389994e
+--- /dev/null
++++ b/app/lifespan/__init__.py
+@@ -0,0 +1,56 @@
++import importlib
++import pkgutil
++from typing import Awaitable, Callable, List
++
++
++def get_all_startup_tasks() -> List[Callable[[], Awaitable[None]]]:
++    """
++    Automatically discovers and imports all startup tasks from module.
++    Returns list of async functions to run on startup.
++    Each module should contain 'startup' async function.
++    Modules can optionally have PRIORITY attribute (lower = higher priority).
++    """
++    modules_with_tasks = []
++    package_dir = __path__[0]
++
++    for _, module_name, is_pkg in pkgutil.iter_modules([package_dir]):
++        if module_name == "__init__":
++            continue
++
++        module = importlib.import_module(f".{module_name}", package=__name__)
++
++        if hasattr(module, "startup") and callable(module.startup):
++            priority = getattr(module, "PRIORITY", 50)  # Default priority is 50
++            modules_with_tasks.append((priority, module.startup))
++
++    # Sort by priority (lower number = higher priority)
++    modules_with_tasks.sort(key=lambda x: x[0])
++
++    return [task for _, task in modules_with_tasks]
++
++
++def get_all_shutdown_tasks() -> List[Callable[[], Awaitable[None]]]:
++    """
++    Automatically discovers and imports all shutdown tasks from module.
++    Returns list of async functions to run on shutdown.
++    Each module should contain 'shutdown' async function.
++    Modules can optionally have PRIORITY attribute (lower = higher priority).
++    Shutdown runs in reverse order of startup (like a matryoshka).
++    """
++    modules_with_tasks = []
++    package_dir = __path__[0]
++
++    for _, module_name, is_pkg in pkgutil.iter_modules([package_dir]):
++        if module_name == "__init__":
++            continue
++
++        module = importlib.import_module(f".{module_name}", package=__name__)
++
++        if hasattr(module, "shutdown") and callable(module.shutdown):
++            priority = getattr(module, "PRIORITY", 50)  # Default priority is 50
++            modules_with_tasks.append((priority, module.shutdown))
++
++    # Sort by priority in reverse order (higher priority shuts down last)
++    modules_with_tasks.sort(key=lambda x: x[0], reverse=True)
++
++    return [task for _, task in modules_with_tasks]
+diff --git a/app/lifespan/logging.py b/app/lifespan/logging.py
+new file mode 100644
+index 0000000..9c6250c
+--- /dev/null
++++ b/app/lifespan/logging.py
+@@ -0,0 +1,22 @@
++from app.services.logging_service import (log_service, setup_logging,
++                                          teardown_logging)
++from app.utils.log_config import setup_root_logger
++
++PRIORITY = 0
++
++
++async def startup():
++    try:
++        setup_root_logger()
++        await setup_logging()
++    except Exception as e:
++        await log_service.log_error("Could not start a logging lifespan")
++        await log_service.log_error(str(e))
++
++
++async def shutdown():
++    try:
++        await teardown_logging()
++    except Exception as e:
++        await log_service.log_error("Could not finish a logging lifespan")
++        await log_service.log_error(str(e))
+diff --git a/app/services/logging_service.py b/app/services/logging_service.py
+index 6b5664e..626a57c 100644
+--- a/app/services/logging_service.py
++++ b/app/services/logging_service.py
+@@ -1,17 +1,19 @@
+ import asyncio
+ import inspect
+ import logging
++import logging.config
+ import secrets
+-from datetime import datetime, timezone
+-from typing import Optional, List, Deque
+ from collections import deque
++from datetime import datetime, timezone
++from typing import Deque, List, Optional
+ 
+-from sqlalchemy.ext.asyncio import AsyncSession
+ from sqlalchemy.exc import SQLAlchemyError
++from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.models.application_logs import ApplicationLogs
+ from app.services.sessionmaking import async_session
+ from app.utils.enums import LogLevel
++from app.utils.log_config import get_log_config
+ 
+ LOGGING_LEVELS = {
+     LogLevel.INFO: logging.INFO,
+@@ -75,8 +77,7 @@ class LogService:
+         # Немедленное логирование в stdout
+         logging.log(
+             self._get_logging_level(level),
+-            "%s: %s (Context: %s)",
+-            level.name,
++            "%s (Context: %s)",
+             message,
+             context
+         )
+@@ -251,6 +252,8 @@ log_service = LogService()
+ # Функции для интеграции с FastAPI lifespan
+ async def setup_logging():
+     """Вызывается при старте приложения"""
++    # Configure root logger with custom format and colors
++    logging.config.dictConfig(get_log_config())
+     await log_service.initialize()
+ 
+ 
+diff --git a/app/utils/__init__.py b/app/utils/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/utils/log_config.py b/app/utils/log_config.py
+new file mode 100644
+index 0000000..a9fad63
+--- /dev/null
++++ b/app/utils/log_config.py
+@@ -0,0 +1,73 @@
++import logging
++import logging.config
++
++
++class ColoredFormatter(logging.Formatter):
++    """Custom formatter with colors for console output"""
++
++    # ANSI color codes
++    COLORS = {
++        'DEBUG': '\033[36m',     # Cyan
++        'INFO': '\033[32m',      # Green
++        'WARNING': '\033[33m',   # Yellow
++        'ERROR': '\033[31m',     # Red
++        'CRITICAL': '\033[35m',  # Magenta
++    }
++    RESET = '\033[0m'
++
++    def format(self, record):
++        # Add color to the level name
++        levelname = record.levelname
++        if levelname in self.COLORS:
++            record.levelname = f"{self.COLORS[levelname]}{levelname}{self.RESET}"
++
++        # Format the message
++        formatted = super().format(record)
++
++        # Reset levelname to original (in case record is used elsewhere)
++        record.levelname = levelname
++
++        return formatted
++
++
++def get_log_config():
++    """Returns logging configuration for the application"""
++    return {
++        "version": 1,
++        "disable_existing_loggers": False,
++        "formatters": {
++            "colored": {
++                "()": ColoredFormatter,
++                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
++                "datefmt": "%Y-%m-%d %H:%M:%S"
++            },
++            "simple": {
++                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
++                "datefmt": "%Y-%m-%d %H:%M:%S"
++            }
++        },
++        "handlers": {
++            "console": {
++                "class": "logging.StreamHandler",
++                "level": "DEBUG",
++                "formatter": "colored",
++                "stream": "ext://sys.stdout"
++            }
++        },
++        "root": {
++            "level": "INFO",
++            "handlers": ["console"]
++        },
++        "loggers": {
++            "root": {
++                "level": "INFO",
++                "handlers": ["console"],
++                "propagate": False
++            }
++        }
++    }
++
++
++def setup_root_logger():
++    """Configure root logger with custom format and colors"""
++    logging.config.dictConfig(get_log_config())
+diff --git a/app/utils/uvicorn_log_config.py b/app/utils/uvicorn_log_config.py
+new file mode 100644
+index 0000000..b4563d1
+--- /dev/null
++++ b/app/utils/uvicorn_log_config.py
+@@ -0,0 +1,35 @@
++log_config = {
++    "version": 1,
++    "disable_existing_loggers": False,
++    "formatters": {
++        "default": {
++            "()": "uvicorn.logging.DefaultFormatter",
++            "format": "%(asctime)s - %(name)s - %(levelprefix)s %(message)s",
++            "datefmt": "%Y-%m-%d %H:%M:%S",
++            "use_colors": True
++        },
++        "access": {
++            "()": "uvicorn.logging.AccessFormatter",
++            "format": '%(asctime)s - %(name)s - %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
++            "datefmt": "%Y-%m-%d %H:%M:%S",
++            "use_colors": True
++        },
++    },
++    "handlers": {
++        "default": {
++            "formatter": "default",
++            "class": "logging.StreamHandler",
++            "stream": "ext://sys.stderr",
++        },
++        "access": {
++            "formatter": "access",
++            "class": "logging.StreamHandler",
++            "stream": "ext://sys.stdout",
++        },
++    },
++    "loggers": {
++        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
++        "uvicorn.error": {"level": "INFO"},
++        "uvicorn.access": {"handlers": ["access"], "level": "INFO", "propagate": False},
++    },
++}
+diff --git a/setup.cfg b/setup.cfg
+index 89a8809..3be5b5f 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -16,7 +16,8 @@ disable =
+     C0103, C0114, C0115, C0116, C0121,
+     E1101, E1102, E1136,
+     R0801,
+-    R0903, R0911, R0913, R0902, R0917,
++    R0901, R0902, R0903,
++    R0911, R0913, R0914, R0915, R0917,
+     R1719,
+     W0105,
+     W0511, W0612, W0613, W0707, W0718
