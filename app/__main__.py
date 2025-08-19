@@ -4,17 +4,24 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import logging_middleware
+from app.lifespan import get_all_shutdown_tasks, get_all_startup_tasks
 from app.routers import get_all_routers
-from app.services.logging_service import setup_logging, teardown_logging
 from app.services.sessionmaking import async_session
+from app.utils.uvicorn_log_config import log_config
 from config import settings
 
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
-    await setup_logging()
+    # Run all startup tasks
+    for startup_task in get_all_startup_tasks():
+        await startup_task()
+
     yield
-    await teardown_logging()
+
+    # Run all shutdown tasks
+    for shutdown_task in get_all_shutdown_tasks():
+        await shutdown_task()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -41,4 +48,9 @@ async def log_requests(request: Request, call_next):
 if __name__ == "__main__":
     import uvicorn  # noqa
 
-    uvicorn.run(app, host="0.0.0.0", port=settings.app.port)  # nosec B104 - safe inside docker behind nginx
+    uvicorn.run(
+        app,
+        host="0.0.0.0",  # nosec B104 - safe inside docker behind nginx
+        port=settings.app.port,
+        log_config=log_config
+    )

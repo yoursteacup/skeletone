@@ -1,17 +1,19 @@
 import asyncio
 import inspect
 import logging
+import logging.config
 import secrets
-from datetime import datetime, timezone
-from typing import Optional, List, Deque
 from collections import deque
+from datetime import datetime, timezone
+from typing import Deque, List, Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.application_logs import ApplicationLogs
 from app.services.sessionmaking import async_session
 from app.utils.enums import LogLevel
+from app.utils.log_config import get_log_config
 
 LOGGING_LEVELS = {
     LogLevel.INFO: logging.INFO,
@@ -75,8 +77,7 @@ class LogService:
         # Немедленное логирование в stdout
         logging.log(
             self._get_logging_level(level),
-            "%s: %s (Context: %s)",
-            level.name,
+            "%s (Context: %s)",
             message,
             context
         )
@@ -251,6 +252,8 @@ log_service = LogService()
 # Функции для интеграции с FastAPI lifespan
 async def setup_logging():
     """Вызывается при старте приложения"""
+    # Configure root logger with custom format and colors
+    logging.config.dictConfig(get_log_config())
     await log_service.initialize()
 
 
