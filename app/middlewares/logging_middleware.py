@@ -1,12 +1,12 @@
 import json
 import logging
+
 from datetime import datetime
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.request_logs import RequestLogs
+from app.services.logging_service import log_service
 
 
 async def convoy_with_logs(request: Request, call_next):
@@ -15,25 +15,20 @@ async def convoy_with_logs(request: Request, call_next):
 
     try:
         # Create log entry for request
-        log_entry = await create_request_log(request)
+        correlation_id = await create_request_log(request)
 
         # That's where magic happens
         response = await call_next(request)
 
-        await complete_request_log(request, response, log_entry, start_time)
+        complete_request_log(request, response, correlation_id, start_time)
         return response
 
     except Exception as e:
-        await request.state.session.rollback()
         logging.error("Error processing request: %s", str(e))
         raise
 
-    finally:
-        await request.state.session.close()
-
 
 async def create_request_log(request: Request):
-    session: AsyncSession = request.state.session
     query_params = dict(request.query_params)
     headers = dict(request.headers.items())  # noqa
 
@@ -49,24 +44,21 @@ async def create_request_log(request: Request):
     if client_ip is None:
         client_ip = proxy_ip
 
-    log_entry = RequestLogs(
-        method=request.method,
-        endpoint=request.url.path,
-        client_ip=client_ip,
-        proxy_ip=proxy_ip,
-        query_params=json.dumps(query_params),
-        request_body=request_body[:1000] if request_body else None,
-        headers=json.dumps(headers),
-    )
-    session.add(log_entry)  # noqa
-    await session.commit()  # noqa
-    await session.refresh(log_entry)  # noqa
+    log_entry = {
+        "method": request.method,
+        "endpoint": request.url.path,
+        "client_ip": client_ip,
+        "proxy_ip": proxy_ip,
+        "query_params": json.dumps(query_params),
+        "request_body": request_body[:1000] if request_body else None,
+        "headers": json.dumps(headers),
+    }
+    correlation_id = log_service.log_request(log_entry)
 
-    return log_entry
+    return correlation_id
 
 
-async def complete_request_log(request, response, log_entry, start_time):
-    session = request.state.session
+def complete_request_log(request, response, correlation_id, start_time):
     process_time = (datetime.now() - start_time).total_seconds()
 
     response_type, response_body = determine_response_type(response)
@@ -79,13 +71,14 @@ async def complete_request_log(request, response, log_entry, start_time):
         process_time
     )
 
-    log_entry.status_code = response.status_code
-    log_entry.response_headers = json.dumps(dict(response.headers))
-    log_entry.response_type = response_type
-    log_entry.response_body = response_body
+    log_data = {
+        "status_code": response.status_code,
+        "response_headers": json.dumps(dict(response.headers)),
+        "response_type": response_type,
+        "response_body": response_body,
+    }
 
-    session.add(log_entry)  # noqa
-    await session.commit()  # noqa
+    log_service.conclude_log_request(log_data, correlation_id)
 
 
 def determine_response_type(response):

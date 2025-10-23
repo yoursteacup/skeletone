@@ -3,10 +3,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import logging_middleware
 from app.lifespan import get_all_shutdown_tasks, get_all_startup_tasks
+from app.middlewares import logging_middleware
+from app.middlewares.bulkhead import BulkheadMiddleware
 from app.routers import get_all_routers
-from app.services.sessionmaking import async_session
 from app.utils.uvicorn_log_config import log_config
 from config import settings
 
@@ -37,11 +37,11 @@ app.add_middleware(
 for router in get_all_routers():
     app.include_router(router)
 
+app.add_middleware(BulkheadMiddleware, max_concurrent_requests=40, timeout=0)
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    session = async_session()
-    request.state.session = session
     return await logging_middleware.convoy_with_logs(request, call_next)
 
 

@@ -1,20 +1,20 @@
-fastapi==0.115.12
-starlette==0.40.0
-uvicorn==0.30.6
+fastapi==0.119.1
+starlette==0.47.2
+uvicorn==0.38.0
 
-requests==2.32.3
-types-requests==2.32.0.20250328
+requests==2.32.5
+types-requests==2.32.4.20250913
 
-sqlalchemy==2.0.34
-alembic==1.13.2
-asyncpg==0.29.0
-psycopg2-binary==2.9.9
+sqlalchemy==2.0.44
+alembic==1.17.0
+asyncpg==0.30.0
+psycopg2-binary==2.9.11
 
-pydantic==2.11.3
-pydantic-settings==2.7.1
+pydantic==2.12.3
+pydantic-settings==2.11.0
 
-mypy==1.15.0
-flake8==7.1.2
-pylint==3.3.5
-isort==6.0.1
-bandit==1.8.3
+mypy==1.18.2
+flake8==7.3.0
+pylint==4.0.2
+isort==7.0.0
+bandit==1.8.6
