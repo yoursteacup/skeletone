@@ -1,0 +1,711 @@
+diff --git a/app/__main__.py b/app/__main__.py
+index f04e1a1..8b61a09 100644
+--- a/app/__main__.py
++++ b/app/__main__.py
+@@ -3,10 +3,10 @@ from contextlib import asynccontextmanager
+ from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+-from app import logging_middleware
+ from app.lifespan import get_all_shutdown_tasks, get_all_startup_tasks
++from app.middlewares import logging_middleware
++from app.middlewares.bulkhead import BulkheadMiddleware
+ from app.routers import get_all_routers
+-from app.services.sessionmaking import async_session
+ from app.utils.uvicorn_log_config import log_config
+ from config import settings
+ 
+@@ -37,11 +37,11 @@ app.add_middleware(
+ for router in get_all_routers():
+     app.include_router(router)
+ 
++app.add_middleware(BulkheadMiddleware, max_concurrent_requests=40, timeout=0)
++
+ 
+ @app.middleware("http")
+ async def log_requests(request: Request, call_next):
+-    session = async_session()
+-    request.state.session = session
+     return await logging_middleware.convoy_with_logs(request, call_next)
+ 
+ 
+diff --git a/app/dependencies/authorization.py b/app/dependencies/authorization.py
+index da8f02b..251e057 100644
+--- a/app/dependencies/authorization.py
++++ b/app/dependencies/authorization.py
+@@ -21,4 +21,4 @@ async def authorize(
+             detail="Missing or invalid Authorization header"
+         )
+ 
+-    return None
+\ No newline at end of file
++    return None
+diff --git a/app/lifespan/logging.py b/app/lifespan/logging.py
+index 9c6250c..5c8dce5 100644
+--- a/app/lifespan/logging.py
++++ b/app/lifespan/logging.py
+@@ -1,22 +1,13 @@
+-from app.services.logging_service import (log_service, setup_logging,
+-                                          teardown_logging)
++from app.services.logging_service import log_service
+ from app.utils.log_config import setup_root_logger
+ 
+ PRIORITY = 0
+ 
+ 
+ async def startup():
+-    try:
+-        setup_root_logger()
+-        await setup_logging()
+-    except Exception as e:
+-        await log_service.log_error("Could not start a logging lifespan")
+-        await log_service.log_error(str(e))
++    setup_root_logger()
++    await log_service.startup()
+ 
+ 
+ async def shutdown():
+-    try:
+-        await teardown_logging()
+-    except Exception as e:
+-        await log_service.log_error("Could not finish a logging lifespan")
+-        await log_service.log_error(str(e))
++    await log_service.shutdown()
+diff --git a/app/middlewares/bulkhead.py b/app/middlewares/bulkhead.py
+new file mode 100644
+index 0000000..4d97128
+--- /dev/null
++++ b/app/middlewares/bulkhead.py
+@@ -0,0 +1,31 @@
++import asyncio
++
++from fastapi.responses import JSONResponse
++from starlette.middleware.base import BaseHTTPMiddleware
++
++
++class BulkheadMiddleware(BaseHTTPMiddleware):
++    def __init__(self, app, max_concurrent_requests: int = 40, timeout: float = 0):
++        super().__init__(app)
++        self.semaphore = asyncio.Semaphore(max_concurrent_requests)
++        self.timeout = timeout
++
++    async def dispatch(self, request, call_next):
++        try:
++            if self.timeout > 0:
++                async with asyncio.wait_for(self.semaphore.acquire(), timeout=self.timeout):
++                    try:
++                        response = await call_next(request)
++                        return response
++                    finally:
++                        self.semaphore.release()
++            else:
++                async with self.semaphore:
++                    response = await call_next(request)
++                    return response
++
++        except asyncio.TimeoutError:
++            return JSONResponse(
++                status_code=420,
++                content={"detail": "Too many concurrent requests"}
++            )
+diff --git a/app/logging_middleware.py b/app/middlewares/logging_middleware.py
+similarity index 66%
+rename from app/logging_middleware.py
+rename to app/middlewares/logging_middleware.py
+index 26a437d..3a12377 100644
+--- a/app/logging_middleware.py
++++ b/app/middlewares/logging_middleware.py
+@@ -1,12 +1,12 @@
+ import json
+ import logging
++
+ from datetime import datetime
+ 
+ from fastapi import Request
+ from fastapi.responses import JSONResponse, Response, StreamingResponse
+-from sqlalchemy.ext.asyncio import AsyncSession
+ 
+-from app.models.request_logs import RequestLogs
++from app.services.logging_service import log_service
+ 
+ 
+ async def convoy_with_logs(request: Request, call_next):
+@@ -15,25 +15,20 @@ async def convoy_with_logs(request: Request, call_next):
+ 
+     try:
+         # Create log entry for request
+-        log_entry = await create_request_log(request)
++        correlation_id = await create_request_log(request)
+ 
+         # That's where magic happens
+         response = await call_next(request)
+ 
+-        await complete_request_log(request, response, log_entry, start_time)
++        complete_request_log(request, response, correlation_id, start_time)
+         return response
+ 
+     except Exception as e:
+-        await request.state.session.rollback()
+         logging.error("Error processing request: %s", str(e))
+         raise
+ 
+-    finally:
+-        await request.state.session.close()
+-
+ 
+ async def create_request_log(request: Request):
+-    session: AsyncSession = request.state.session
+     query_params = dict(request.query_params)
+     headers = dict(request.headers.items())  # noqa
+ 
+@@ -49,24 +44,21 @@ async def create_request_log(request: Request):
+     if client_ip is None:
+         client_ip = proxy_ip
+ 
+-    log_entry = RequestLogs(
+-        method=request.method,
+-        endpoint=request.url.path,
+-        client_ip=client_ip,
+-        proxy_ip=proxy_ip,
+-        query_params=json.dumps(query_params),
+-        request_body=request_body[:1000] if request_body else None,
+-        headers=json.dumps(headers),
+-    )
+-    session.add(log_entry)  # noqa
+-    await session.commit()  # noqa
+-    await session.refresh(log_entry)  # noqa
++    log_entry = {
++        "method": request.method,
++        "endpoint": request.url.path,
++        "client_ip": client_ip,
++        "proxy_ip": proxy_ip,
++        "query_params": json.dumps(query_params),
++        "request_body": request_body[:1000] if request_body else None,
++        "headers": json.dumps(headers),
++    }
++    correlation_id = log_service.log_request(log_entry)
+ 
+-    return log_entry
++    return correlation_id
+ 
+ 
+-async def complete_request_log(request, response, log_entry, start_time):
+-    session = request.state.session
++def complete_request_log(request, response, correlation_id, start_time):
+     process_time = (datetime.now() - start_time).total_seconds()
+ 
+     response_type, response_body = determine_response_type(response)
+@@ -79,13 +71,14 @@ async def complete_request_log(request, response, log_entry, start_time):
+         process_time
+     )
+ 
+-    log_entry.status_code = response.status_code
+-    log_entry.response_headers = json.dumps(dict(response.headers))
+-    log_entry.response_type = response_type
+-    log_entry.response_body = response_body
++    log_data = {
++        "status_code": response.status_code,
++        "response_headers": json.dumps(dict(response.headers)),
++        "response_type": response_type,
++        "response_body": response_body,
++    }
+ 
+-    session.add(log_entry)  # noqa
+-    await session.commit()  # noqa
++    log_service.conclude_log_request(log_data, correlation_id)
+ 
+ 
+ def determine_response_type(response):
+diff --git a/app/services/logging_service.py b/app/services/logging_service.py
+index 626a57c..31d45be 100644
+--- a/app/services/logging_service.py
++++ b/app/services/logging_service.py
+@@ -1,222 +1,185 @@
+ import asyncio
+ import inspect
+ import logging
+-import logging.config
+-import secrets
++import uuid
+ from collections import deque
+-from datetime import datetime, timezone
+-from typing import Deque, List, Optional
++from datetime import datetime
++from typing import List, Optional, Tuple
+ 
+-from sqlalchemy.exc import SQLAlchemyError
++from sqlalchemy import insert, update
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.models.application_logs import ApplicationLogs
+-from app.services.sessionmaking import async_session
++from app.models.request_logs import RequestLogs
++from app.services.sessionmaking import log_session
+ from app.utils.enums import LogLevel
+-from app.utils.log_config import get_log_config
+-
+-LOGGING_LEVELS = {
+-    LogLevel.INFO: logging.INFO,
+-    LogLevel.WARNING: logging.WARNING,
+-    LogLevel.ERROR: logging.ERROR,
+-    LogLevel.DEBUG: logging.DEBUG,
+-}
+ 
+ 
+ class LogService:
+-    """
+-    Асинхронный сервис логирования для FastAPI.
+-    Использует батчинг и фоновую задачу для эффективной записи в БД.
+-    """
+-
+     def __init__(
+-        self,
+-        batch_size: int = 50,
+-        flush_interval: float = 2.0,
+-        max_retries: int = 3,
+-        retry_base_delay: float = 0.5,
+-        retry_max_delay: float = 5.0,
++            self,
++            flush_interval: float = 3.0,
++            batch_size: int = 20,
++            retry_limit: int = 5,
++            retry_base_delay: float = 1.0,
++            write_to_stdout: bool = True,
++            with_context: bool = True,
++            fallback_file: str = "failed_logs.txt"
+     ):
+-        self._batch: Deque[tuple] = deque()
+-        self._batch_size = batch_size
+-        self._flush_interval = flush_interval
+-        self._lock = asyncio.Lock()
+-        self._last_flush = datetime.now(timezone.utc)
+-        self._flush_task: Optional[asyncio.Task] = None
+-
+-        # Retry configuration
+-        self._max_retries = max_retries
+-        self._retry_base_delay = retry_base_delay
+-        self._retry_max_delay = retry_max_delay
+-
+-        # Failed batch storage for retry
+-        self._failed_batches: Deque[List[tuple]] = deque(maxlen=100)
+-
+-    async def initialize(self):
+-        """Инициализация сервиса при старте приложения"""
+-        self._flush_task = asyncio.create_task(self._periodic_flush())
+-        logging.info("LogService initialized with batch_size=%d, flush_interval=%.1fs",
+-                     self._batch_size, self._flush_interval)
+-
+-    async def shutdown(self):
+-        """Корректное завершение работы при остановке приложения"""
+-        if self._flush_task:
+-            self._flush_task.cancel()
++        # Settings
++        self._request_map: dict = {}
++        self.flush_interval = flush_interval
++        self.batch_size = batch_size
++        self.retry_limit = retry_limit
++        self.retry_base_delay = retry_base_delay
++        self.write_to_stdout = write_to_stdout
++        self.with_context = with_context
++        self.fallback_file = fallback_file
++
++        # Queues
++        self._queue: deque = deque()
++        self._failed_batches: deque = deque(maxlen=100)
++
++        # Metrics
++        self.logs_written = 0
++        self.batches_failed = 0
++        self.batches_retried = 0
++
++        # Async infra
++        self._task: Optional[asyncio.Task] = None
++        self._stop_event = asyncio.Event()
++
++        self._logger = logging.getLogger("LogService")
++        self._logger.setLevel(logging.INFO)
++
++    async def startup(self) -> None:
++        self._stop_event.clear()
++        self._task = asyncio.create_task(self._periodic_flush())
++        self._logger.info("LogService started")
++
++    async def shutdown(self) -> None:
++        self._stop_event.set()
++        if self._task:
++            self._task.cancel()
+             try:
+-                await self._flush_task
++                await self._task
+             except asyncio.CancelledError:
+                 pass
+ 
+         await self._force_flush()
+-        logging.info("LogService shutdown complete")
+-
+-    async def log(self, message: str, level: LogLevel):
+-        """Основной метод логирования"""
+-        context = self._get_context()
+-
+-        # Немедленное логирование в stdout
+-        logging.log(
+-            self._get_logging_level(level),
+-            "%s (Context: %s)",
+-            message,
+-            context
+-        )
+-
+-        # Добавляем в батч для БД
+-        async with self._lock:
+-            self._batch.append((
+-                message,
++        self._logger.info("LogService stopped")
++
++    def log_request(self, request_data: dict) -> str:
++        correlation_id = uuid.uuid4().hex[:8]
++        request_data["correlation_id"] = correlation_id
++        self._queue.append(("request_insert", request_data))
++
++        return correlation_id
++
++    def conclude_log_request(self, request_data: dict, correlation_id: str) -> None:
++        self._queue.append(("request_update", {**request_data, "correlation_id": correlation_id}))
++
++    def log(
++            self,
++            level: str,
++            message: str,
++            context: Optional[str] = None,
++    ) -> None:
++        if self.with_context and not context:
++            context = self._get_context()
++
++        record = ("app", {
++            "creation_date": datetime.now(),
++            "level": level,
++            "message": message,
++            "context": context,
++        })
++        self._queue.append(record)
++
++        if self.write_to_stdout:
++            self._logger.info(
++                "[%s] %s%s",
+                 level,
+-                context,
+-                datetime.now(timezone.utc)
+-            ))
+-
+-            # Проверяем необходимость немедленного flush
+-            if len(self._batch) >= self._batch_size:
+-                await self._flush()
+-
+-    async def log_info(self, message: str):
+-        await self.log(message, LogLevel.INFO)
+-
+-    async def log_warning(self, message: str):
+-        await self.log(message, LogLevel.WARNING)
++                message,
++                f" ({context})" if context else ''
++            )
+ 
+-    async def log_error(self, message: str):
+-        await self.log(message, LogLevel.ERROR)
++    def log_info(self, message: str):
++        self.log(LogLevel.INFO.value, message)
+ 
+-    async def log_debug(self, message: str):
+-        await self.log(message, LogLevel.DEBUG)
++    def log_warning(self, message: str):
++        self.log(LogLevel.WARNING.value, message)
+ 
+-    async def _periodic_flush(self):
+-        """Периодическая задача для flush логов"""
+-        while True:
+-            try:
+-                await asyncio.sleep(self._flush_interval)
++    def log_error(self, message: str):
++        self.log(LogLevel.ERROR.value, message)
+ 
+-                async with self._lock:
+-                    if self._batch:
+-                        await self._flush()
++    def log_debug(self, message: str):
++        self.log(LogLevel.DEBUG.value, message)
+ 
+-                    # Пытаемся переотправить неудачные батчи
+-                    if self._failed_batches:
+-                        await self._retry_failed_batches()
++    async def _periodic_flush(self) -> None:
++        while not self._stop_event.is_set():
++            await asyncio.sleep(self.flush_interval)
++            await self._flush_once()
+ 
+-            except asyncio.CancelledError:
+-                break
+-            except Exception as e:
+-                logging.error("Error in periodic flush: %s", e)
+-
+-    async def _force_flush(self):
+-        """Принудительный flush всех логов"""
+-        async with self._lock:
+-            if self._batch:
+-                await self._flush()
+-
+-    async def _flush(self):
+-        """Сохранение батча логов в БД (вызывается под lock)"""
+-        if not self._batch:
++    async def _flush_once(self) -> None:
++        if not self._queue and not self._failed_batches:
+             return
+ 
+-        # Копируем батч и очищаем
+-        batch_to_save = list(self._batch)
+-        self._batch.clear()
+-        self._last_flush = datetime.now(timezone.utc)
++        batch = [self._queue.popleft() for _ in range(min(len(self._queue), self.batch_size))]
++        if batch:
++            await self._write_with_retry(batch)
+ 
+-        # Сохраняем без блокировки основного потока
+-        success = await self._save_batch_with_retry(batch_to_save)
+-
+-        if not success:
+-            # Сохраняем неудачный батч для последующей попытки
+-            self._failed_batches.append(batch_to_save)
+-            logging.error("Failed to save batch after %d retries, stored for later", self._max_retries)
+-
+-    async def _save_batch_with_retry(self, batch: List[tuple]) -> bool:
+-        """Сохранение батча с retry логикой"""
+-        for attempt in range(self._max_retries):
++    async def _write_with_retry(
++            self,
++            batch: List[Tuple[str, dict]],
++            retrying: bool = False
++    ) -> None:
++        for attempt in range(self.retry_limit):
+             try:
+-                async with async_session() as session:
+-                    await self._save_batch(session, batch)
+-                return True
+-            except SQLAlchemyError as e:
+-                if attempt < self._max_retries - 1:
+-                    # Экспоненциальная задержка с jitter
+-                    delay = min(
+-                        self._retry_base_delay * (2 ** attempt) + secrets.randbelow(100) / 1000,
+-                        self._retry_max_delay
+-                    )
+-                    logging.warning(
+-                        "Database error on attempt %d/%d: %s. Retrying in %.2fs...",
+-                        attempt + 1, self._max_retries, e, delay
++                async with log_session() as session:
++                    await self._write_batch(session, batch)
++                self.logs_written += len(batch)
++                if retrying:
++                    self.batches_retried += 1
++                return
++            except Exception:
++                delay = self.retry_base_delay * (2**attempt) + (0.1 * attempt)
++                await asyncio.sleep(delay)
++
++        self.batches_failed += 1
++        self._failed_batches.append(batch)
++        await self._fallback_to_file(batch)
++
++    async def _write_batch(
++            self,
++            session: AsyncSession,
++            batch: List[Tuple[str, dict]]
++    ) -> None:
++        for kind, data in batch:
++            if kind == "app":
++                await session.execute(insert(ApplicationLogs).values(**data))
++            elif kind == "request_insert":
++                correlation_id = data["correlation_id"]
++                del data["correlation_id"]
++                res = await session.execute(
++                    insert(RequestLogs).values(**data).returning(RequestLogs.id)
++                )
++                request_id = res.scalar()
++                self._request_map[correlation_id] = request_id
++            elif kind == "request_update":
++                request_id = self._request_map.get(data["correlation_id"])
++                del data["correlation_id"]
++                if request_id:
++                    await session.execute(
++                        update(RequestLogs)
++                        .where(RequestLogs.id == request_id)
++                        .values(**data)
+                     )
+-                    await asyncio.sleep(delay)
+-                else:
+-                    logging.error("Final attempt failed: %s", e)
+-            except Exception as e:
+-                # Неожиданная ошибка - не пытаемся повторить
+-                logging.error("Unexpected error saving batch: %s", e)
+-                return False
+-
+-        return False
+-
+-    async def _retry_failed_batches(self):
+-        """Повторная попытка отправки неудачных батчей"""
+-        if not self._failed_batches:
+-            return
+-
+-        # Берем до 5 батчей для повторной отправки
+-        batches_to_retry = []
+-        for _ in range(min(5, len(self._failed_batches))):
+-            batches_to_retry.append(self._failed_batches.popleft())
+ 
+-        successfully_sent = 0
+-        for batch in batches_to_retry:
+-            if await self._save_batch_with_retry(batch):
+-                successfully_sent += 1
+-            else:
+-                # Возвращаем в конец очереди
+-                self._failed_batches.append(batch)
+-
+-        if successfully_sent > 0:
+-            logging.info("Successfully resent %d failed batches", successfully_sent)
+-
+-    async def _save_batch(self, session: AsyncSession, batch: List[tuple]):
+-        """Сохранение батча в БД"""
+-        logs = []
+-        for message, level, context, timestamp in batch:
+-            log = ApplicationLogs(
+-                message=message,
+-                level=level.value,
+-                context=context,
+-            )
+-            # Преобразуем timezone-aware datetime в naive для PostgreSQL
+-            log.creation_date = timestamp.replace(tzinfo=None)
+-            logs.append(log)
++            await session.commit()
+ 
+-        session.add_all(logs)
+-        await session.commit()
+-
+-    def _get_context(self) -> str:
+-        """Получение контекста вызова"""
++    @staticmethod
++    def _get_context() -> str:
+         current_frame = inspect.currentframe()
+         frames_to_skip = 3
+ 
+@@ -240,23 +203,25 @@ class LogService:
+ 
+         return "unknown"
+ 
+-    @staticmethod
+-    def _get_logging_level(level: LogLevel):
+-        return LOGGING_LEVELS[level]
++    async def _force_flush(self) -> None:
++        while self._queue:
++            batch = [self._queue.popleft() for _ in range(min(len(self._queue), self.batch_size))]
++            try:
++                async with log_session() as session:
++                    await self._write_batch(session, batch)
++            except Exception:
++                await self._fallback_to_file(batch)
++
++    async def _fallback_to_file(self, batch: List[Tuple[str, dict]]) -> None:
++        try:
++            with open(self.fallback_file, "a", encoding="utf-8") as f:
++                for row in batch:
++                    f.write(
++                        f"{row[1]['creation_date']} [{row[1]['level']}]"
++                        f" {row[1]['message']} {row[1].get('context', '')}\n"
++                    )
++        except Exception:
++            pass  # nosec B110 - Fallback must not fail
+ 
+ 
+-# Глобальный экземпляр сервиса
+ log_service = LogService()
+-
+-
+-# Функции для интеграции с FastAPI lifespan
+-async def setup_logging():
+-    """Вызывается при старте приложения"""
+-    # Configure root logger with custom format and colors
+-    logging.config.dictConfig(get_log_config())
+-    await log_service.initialize()
+-
+-
+-async def teardown_logging():
+-    """Вызывается при остановке приложения"""
+-    await log_service.shutdown()
+diff --git a/app/services/sessionmaking.py b/app/services/sessionmaking.py
+index b2603e4..3d78d24 100644
+--- a/app/services/sessionmaking.py
++++ b/app/services/sessionmaking.py
+@@ -11,10 +11,23 @@ DATABASE_URL = (
+     f"@{db_settings.host}:{db_settings.port}/{db_settings.database}"
+ )
+ 
+-engine = create_async_engine(DATABASE_URL, echo=False)
+-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
++main_engine = create_async_engine(
++    DATABASE_URL,
++    echo=False,
++    pool_size=10,
++    max_overflow=20,
++    pool_timeout=30,
++    pool_recycle=1800,
++)
++log_engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
++
++main_session = async_sessionmaker(main_engine, class_=AsyncSession, expire_on_commit=False)
++log_session = async_sessionmaker(log_engine, class_=AsyncSession, expire_on_commit=False)
+ 
+ 
+ async def get_session() -> AsyncGenerator[AsyncSession, None]:
+-    async with async_session() as session:
++    session = main_session()
++    try:
+         yield session
++    finally:
++        await session.close()
+diff --git a/requirements.txt b/requirements.txt
+index 7b0843d..2457652 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,20 +1,20 @@
+-fastapi==0.115.12
+-starlette==0.40.0
+-uvicorn==0.30.6
++fastapi==0.119.1
++starlette==0.47.2
++uvicorn==0.38.0
+ 
+-requests==2.32.3
+-types-requests==2.32.0.20250328
++requests==2.32.5
++types-requests==2.32.4.20250913
+ 
+-sqlalchemy==2.0.34
+-alembic==1.13.2
+-asyncpg==0.29.0
+-psycopg2-binary==2.9.9
++sqlalchemy==2.0.44
++alembic==1.17.0
++asyncpg==0.30.0
++psycopg2-binary==2.9.11
+ 
+-pydantic==2.11.3
+-pydantic-settings==2.7.1
++pydantic==2.12.3
++pydantic-settings==2.11.0
+ 
+-mypy==1.15.0
+-flake8==7.1.2
+-pylint==3.3.5
+-isort==6.0.1
+-bandit==1.8.3
+\ No newline at end of file
++mypy==1.18.2
++flake8==7.3.0
++pylint==4.0.2
++isort==7.0.0
++bandit==1.8.6
+\ No newline at end of file
