@@ -42,13 +42,12 @@ git push origin --tags
 echo
 echo "→ 3) Генерируем дифф-патч…"
 # находим два последних тега по дате создания
-mapfile -t TAGS < <(git tag --sort=-creatordate)
-if (( ${#TAGS[@]} < 2 )); then
+LATEST_TAG=$(git tag --sort=-creatordate | head -n 1)
+PREV_TAG=$(git tag --sort=-creatordate | head -n 2 | tail -n 1)
+if [ -z "$LATEST_TAG" ] || [ -z "$PREV_TAG" ]; then
   echo "❗️ Ошибка: нужно минимум два тега для создания патча."
   exit 1
 fi
-LATEST_TAG=${TAGS[0]}
-PREV_TAG=${TAGS[1]}
 
 mkdir -p patches
 PATCH_FILE="patches/${PREV_TAG}_to_${LATEST_TAG}.patch"
